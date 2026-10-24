@@ -1,0 +1,8 @@
+.venv/
+skill/.env
+__pycache__/
+*.pyc
+.DS_Store
+preferences.json
+.claude/
+.pytest_cache/
