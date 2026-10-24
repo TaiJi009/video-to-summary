@@ -184,23 +184,45 @@ _SUBTITLE_LANGS = ["zh-Hans", "zh-CN", "ai-zh", "zh", "en"]
 _BILI_AI_LANS = ("ai-zh", "zh-Hans", "zh-CN", "zh")
 
 
-def _bili_ai_subtitle_via_api(url: str, task_dir: Path, stem: str) -> Path | None:
+def _write_bili_json_as_srt(body: list, srt_path: Path) -> bool:
+    """B站 AI 字幕 JSON body → SRT 落盘。"""
+    from .subtitles import ms_to_srt_time
+
+    lines = []
+    for item in body:
+        begin = ms_to_srt_time(float(item.get("from") or 0) * 1000)
+        end = ms_to_srt_time(float(item.get("to") or 0) * 1000)
+        text = (item.get("content") or "").strip()
+        if not text:
+            continue
+        lines.append(f"{len(lines) + 1}\n{begin} --> {end}\n{text}\n")
+    if not lines:
+        return False
+    srt_path.parent.mkdir(parents=True, exist_ok=True)
+    srt_path.write_text("\n".join(lines), encoding="utf-8")
+    return True
+
+
+def _bili_ai_subtitle_via_api(
+    url: str, task_dir: Path, stem: str, languages: str | list | None
+) -> tuple[Path | None, list[str]]:
     """yt-dlp 拿不到 B站 AI 字幕（其 extractor 的字幕请求不带 Cookie），
-    直接调 player API 用 Cookie 取 ai-zh 轨 JSON 转 SRT。失败返回 None。"""
-    import json as _json
+    直接调 player API 用 Cookie 取字幕轨 JSON 转 SRT。
+
+    languages: None=仅主轨；"all"=全部轨；list=指定语言。
+    返回 (主轨 SRT 路径 | None, 拉到的语言列表)。"""
     import re as _re
 
     import httpx
 
     from . import config
-    from .subtitles import ms_to_srt_time
 
     ck = config.bilibili_cookie()
     if not ck:
-        return None
+        return None, []
     m = _re.search(r"(BV[\w]+)", url)
     if not m:
-        return None
+        return None, []
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -209,10 +231,10 @@ def _bili_ai_subtitle_via_api(url: str, task_dir: Path, stem: str) -> Path | Non
         "Referer": "https://www.bilibili.com/",
         "Cookie": ck,
     }
+    want_all = languages == "all"
+    want_set = set(languages) if isinstance(languages, list) else None
     try:
         with httpx.Client(timeout=30.0, trust_env=False) as client:
-            # BV → aid/cid：走 view API 拿 cid（wbi 签名对 player API 非必需的旧接口也行；
-            # 直接用 wbi/v2 无签名在带 Cookie + Referer 时通常可用）
             vr = client.get(
                 "https://api.bilibili.com/x/web-interface/view",
                 params={"bvid": m.group(1)},
@@ -224,7 +246,7 @@ def _bili_ai_subtitle_via_api(url: str, task_dir: Path, stem: str) -> Path | Non
             if pages:
                 cid = str(pages[0].get("cid") or "")
             if not (aid and cid):
-                return None
+                return None, []
 
             pr = client.get(
                 "https://api.bilibili.com/x/player/wbi/v2",
@@ -232,46 +254,69 @@ def _bili_ai_subtitle_via_api(url: str, task_dir: Path, stem: str) -> Path | Non
                 headers=headers,
             )
             subs = ((pr.json() or {}).get("data") or {}).get("subtitle", {}).get("subtitles") or []
-            track = next((s for s in subs if s.get("lan") in _BILI_AI_LANS), None)
-            if not track:
-                return None
-            s_url = track.get("subtitle_url") or ""
-            if s_url.startswith("//"):
-                s_url = "https:" + s_url
-            if not s_url:
-                return None
+            if not subs:
+                return None, []
 
-            jr = client.get(s_url, headers={"User-Agent": headers["User-Agent"], "Referer": "https://www.bilibili.com/"})
-            body = jr.json().get("body") or []
-            if not body:
-                return None
+            # 主轨：中文 AI 轨优先，否则第一轨
+            main_track = next((s for s in subs if s.get("lan") in _BILI_AI_LANS), subs[0])
 
-            lines = []
-            for i, item in enumerate(body, start=1):
-                begin = ms_to_srt_time(float(item.get("from") or 0) * 1000)
-                end = ms_to_srt_time(float(item.get("to") or 0) * 1000)
-                text = (item.get("content") or "").strip()
-                if not text:
+            # 附加轨：按 languages 策略挑选（主轨之外的）
+            extra_tracks = []
+            for s in subs:
+                if s is main_track:
                     continue
-                lines.append(f"{len(lines) + 1}\n{begin} --> {end}\n{text}\n")
-            if not lines:
-                return None
-            srt_path = task_dir / f"{stem}.srt"
-            srt_path.parent.mkdir(parents=True, exist_ok=True)
-            srt_path.write_text("\n".join(lines), encoding="utf-8")
-            return srt_path
+                lan = s.get("lan") or ""
+                if want_all or (want_set and lan in want_set):
+                    extra_tracks.append(s)
+
+            fetched: list[str] = []
+            main_path: Path | None = None
+            dl_headers = {"User-Agent": headers["User-Agent"], "Referer": "https://www.bilibili.com/"}
+
+            def _fetch_body(s_url: str) -> list:
+                if s_url.startswith("//"):
+                    s_url = "https:" + s_url
+                jr = client.get(s_url, headers=dl_headers)
+                return jr.json().get("body") or []
+
+            body = _fetch_body(main_track.get("subtitle_url") or "")
+            if body and _write_bili_json_as_srt(body, task_dir / f"{stem}.srt"):
+                main_path = task_dir / f"{stem}.srt"
+                fetched.append(main_track.get("lan") or "")
+
+            for s in extra_tracks:
+                lan = s.get("lan") or "x"
+                body = _fetch_body(s.get("subtitle_url") or "")
+                if body and _write_bili_json_as_srt(body, task_dir / f"{stem}.{lan}.srt"):
+                    fetched.append(lan)
+
+            return main_path, fetched
     except Exception:
-        return None
+        return None, []
 
 
-def try_platform_subtitles(url: str, task_dir: Path, stem: str) -> Path | None:
+def try_platform_subtitles(
+    url: str, task_dir: Path, stem: str, languages: str | list | None = None
+) -> Path | None:
     """尝试拉取平台现成字幕轨（YouTube 自动字幕 / B站 AI 字幕）。
 
-    命中则规范成 SRT 落盘并返回路径；未命中返回 None（调用方走 ASR）。
+    languages: None=仅主语言（向后兼容）；"all"=全部轨；list=指定语言。
+    命中则主轨规范成 SRT 落盘并返回路径；未命中返回 None（调用方走 ASR）。
+    附加语言轨落 <stem>.<lan>.srt，语言清单由调用方从文件系统或 get_subtitle_languages 读。
     """
     import yt_dlp
 
     from .metadata import ytdlp_http_headers
+
+    want_all = languages == "all"
+    want_set = set(languages) if isinstance(languages, list) else None
+    yt_langs = _SUBTITLE_LANGS
+    # YouTube 的 "all" 若设 subtitleslangs=['all'] 会拉 100+ 机翻轨（逐一请求，不可用），
+    # 降级为常用语集；B站 player API 的 all 才是真正的全轨
+    if want_all:
+        yt_langs = ["en", "zh-Hans", "zh", "ja", "ko", "es", "fr", "de"]
+    elif want_set:
+        yt_langs = sorted(want_set | {"en"})
 
     opts = {
         "quiet": True,
@@ -280,11 +325,18 @@ def try_platform_subtitles(url: str, task_dir: Path, stem: str) -> Path | None:
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitleslangs": _SUBTITLE_LANGS,
+        "subtitleslangs": yt_langs,
         "subtitlesformat": "srt/vtt/best",
         "outtmpl": str(task_dir / f"{stem}.%(ext)s"),
         "http_headers": ytdlp_http_headers(url),
     }
+    # YouTube 对无 Cookie 请求常弹人机验证；YOUTUBE_COOKIE_BROWSER=chrome 等
+    # 可借浏览器登录态（需对应浏览器已登录 YouTube）
+    from . import config as _cfg
+
+    cookie_browser = _cfg.youtube_cookie_browser()
+    if cookie_browser:
+        opts["cookiesfrombrowser"] = (cookie_browser,)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -306,4 +358,17 @@ def try_platform_subtitles(url: str, task_dir: Path, stem: str) -> Path | None:
             return srt_path
 
     # yt-dlp 拿不到（B站 extractor 不带 Cookie 请求字幕）→ player API 直查
-    return _bili_ai_subtitle_via_api(url, task_dir, stem)
+    main_path, _fetched = _bili_ai_subtitle_via_api(url, task_dir, stem, languages)
+    return main_path
+
+
+def get_subtitle_languages(task_dir: Path, stem: str) -> list[str]:
+    """扫描任务目录里已落盘的字幕轨语言（主轨记为 srt 文件本身）。"""
+    if not task_dir.is_dir():
+        return []
+    langs = []
+    for p in sorted(task_dir.glob(f"{stem}.*.srt")):
+        lan = p.name[len(stem) + 1 : -len(".srt")]
+        if lan and lan not in ("16k",):
+            langs.append(lan)
+    return langs

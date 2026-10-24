@@ -101,18 +101,27 @@ def process_single_task(run_dir: Path, entry: dict) -> None:
         stem = sanitize_filename(display_title or "video")
         log(10, f"元数据: {display_title or url}")
 
-        # 2. 平台字幕轨捷径（零成本零等待）
-        subtitle_path = try_platform_subtitles(url, task_dir, stem)
+        # 2. 平台字幕轨捷径（零成本零等待；--languages 控制多语言拉取）
+        languages = RUN_STATE.get("languages")  # "all" | "zh,en,es" | None
+        if languages == "all" or languages is None:
+            lang_arg = languages
+        else:
+            lang_arg = [x.strip() for x in str(languages).split(",") if x.strip()]
+        subtitle_path = try_platform_subtitles(url, task_dir, stem, lang_arg)
         if subtitle_path is not None:
             entry["asr_source"] = "platform_subtitle"
             entry["subtitle_path"] = str(subtitle_path.resolve())
+            from videotext_core.downloader import get_subtitle_languages
+
+            entry["subtitle_languages"] = get_subtitle_languages(task_dir, stem)
             from videotext_core.subtitles import read_subtitle_plain_text
 
             transcript_txt = task_dir / f"{stem}.txt"
             write_txt(transcript_txt, read_subtitle_plain_text(subtitle_path) or "")
             entry["transcript_path"] = str(transcript_txt.resolve())
             entry["status"] = "completed"
-            log(100, f"使用平台现成字幕: {subtitle_path.name}")
+            extra = f"（含 {len(entry['subtitle_languages'])} 个语言轨）" if entry["subtitle_languages"] else ""
+            log(100, f"使用平台现成字幕: {subtitle_path.name}{extra}")
             return
 
         # 3. 下载
@@ -261,6 +270,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     m = manifest.create_manifest(run_dir, run_id, urls)
     RUN_STATE["manifest"] = m
     RUN_STATE["verbose"] = args.verbose
+    RUN_STATE["languages"] = args.languages
 
     max_workers = max(1, min(int(args.max_workers), len(urls)))
 
@@ -320,6 +330,8 @@ def main() -> int:
     p_run.add_argument("--max-workers", type=int, default=3)
     p_run.add_argument("--asr-engine", choices=("dashscope", "whisper"), default="dashscope",
                        help="ASR 引擎：dashscope 云端（默认，需 key）或 whisper 本地（免额度）")
+    p_run.add_argument("--languages", default=None, metavar="all|zh,en,..",
+                       help="多语言字幕拉取：all=全部轨；逗号列表=指定语言；缺省仅主语言（仅字幕轨来源有效，ASR 引擎只出音视频原语）")
     p_run.add_argument("--verbose", action="store_true")
     p_run.set_defaults(func=cmd_run)
 

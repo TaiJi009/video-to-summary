@@ -41,6 +41,7 @@ def task_entry(url: str, index: int) -> dict:
         "duration_seconds": None,
         "asr_source": None,
         "subtitle_path": None,
+        "subtitle_languages": [],
         "transcript_path": None,
     }
 

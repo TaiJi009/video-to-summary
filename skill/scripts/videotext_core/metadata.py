@@ -18,6 +18,8 @@ def detect_platform(url: str) -> str:
         return "bilibili"
     if "xiaohongshu.com" in u or "xhslink.com" in u:
         return "xiaohongshu"
+    if "youtube.com" in u or "youtu.be" in u:
+        return "youtube"
     return "unknown"
 
 
@@ -169,6 +171,11 @@ def extract_info_metadata_only(url: str) -> dict | None:
         "noplaylist": True,
         "http_headers": ytdlp_http_headers(fetch_url),
     }
+    # YouTube 对无 Cookie 请求常弹人机验证（元数据拉不到 → 标题缺失）
+    if "youtube.com" in fetch_url or "youtu.be" in fetch_url:
+        cookie_browser = config.youtube_cookie_browser()
+        if cookie_browser:
+            opts["cookiesfrombrowser"] = (cookie_browser,)
 
     if is_xhslink_url(url):
         fb = xiaohongshu_metadata_from_video_page(url)

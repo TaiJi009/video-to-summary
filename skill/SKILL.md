@@ -1,12 +1,12 @@
 ---
 name: video-to-summary
-description: 将粘贴的视频 URL（B站/小红书/YouTube/通用站点）批量下载并转写为逐字稿（真时间轴 SRT + 纯文本 TXT）。三种 ASR 来源：平台字幕轨捷径（零成本）、云端 DashScope paraformer-v2（单文件最长 2 小时）、本地 whisper（--asr-engine whisper，免额度离线）。总结由调用方 agent 的模型完成，本 skill 不内置任何 LLM 调用。触发词：视频转文字、逐字稿、字幕、批量转写、B站视频总结、小红书视频转写。
-version: 0.4.0
+description: 将粘贴的视频 URL（B站/小红书/YouTube/通用站点）批量下载并转写为逐字稿（真时间轴 SRT + 纯文本 TXT，支持多语言字幕轨）。三种 ASR 来源：平台字幕轨捷径（零成本）、云端 DashScope paraformer-v2（单文件最长 2 小时）、本地 whisper（--asr-engine whisper，免额度离线）。总结由调用方 agent 的模型完成，本 skill 不内置任何 LLM 调用。触发词：视频转文字、逐字稿、字幕、多语言字幕、翻译字幕、批量转写、B站视频总结、小红书视频转写、YouTube 视频总结。
+version: 0.5.0
 ---
 
 # video-to-summary
 
-将视频 URL 转写为逐字稿。三种 ASR 来源：平台字幕轨捷径（优先零成本）、云端 DashScope paraformer-v2（异步任务 API，句级时间戳）、本地 whisper（可选引擎，免额度）。**总结由你（调用方 agent）的模型完成**——skill 只负责到逐字稿为止。
+将视频 URL 转写为逐字稿。三种 ASR 来源：平台字幕轨捷径（优先零成本）、云端 DashScope paraformer-v2（异步任务 API，句级时间戳）、本地 whisper（可选引擎，免额度）。**总结由你（调用方 agent）的模型完成**——skill 只负责到逐字稿为止。支持多语言字幕轨拉取（`--languages`）。
 
 ## 前置检查（每次会话首次使用时）
 
@@ -29,6 +29,18 @@ CLI 不会自行猜目录。解析顺序：
 
 **禁止**在用户未表态时自行挑选目录跳过询问——首次报错（退出码 2）是设计行为，提示里已含补救指令。
 
+## 多语言询问（run 前）
+
+与产物目录询问同一次问全（batch 场景一次问完，不在 CLI 运行中打断）：
+
+1. **是否需要多语言字幕？** 三选一：
+   - **只要主语言**（默认推荐）：不带 `--languages`，产物最干净
+   - **全部语言轨**：`--languages all`
+   - **指定几种**：`--languages zh,en,ja`（逗号分隔）
+2. 用户说不清轨道情况时可直接说明：B站 AI 字幕通常有中文主轨 + 若干机翻轨；YouTube 几乎总是有 100+ 自动机翻轨（`all` 时 skill 自动降级为常用语集，不会全拉）。
+
+**重要事实**：多语言译文**只有字幕轨路径能提供**。ASR 路径（paraformer / whisper）只识别音视频原语、不做翻译——凡走到 ASR 的任务，产物永远只有原语一份逐字稿，此时不用问多语言。
+
 ## 两段式流程
 
 ### 第 1 段：CLI 产逐字稿
@@ -49,10 +61,15 @@ CLI 不会自行猜目录。解析顺序：
 
 ### 第 2 段：agent 总结（你来做）
 
-**总结前先问一句**：需要带时间戳的「时间线」小节吗？（长视频 >30 分钟时主动推荐选"要"——时间锚点对回看定位很实用；短视频默认建议不要）。用户答复决定读取策略：
+**总结前先问一次（两个问题合并问）**：
+1. 需要带时间戳的「时间线」小节吗？（长视频 >30 分钟时主动推荐选"要"——时间锚点对回看定位很实用；短视频默认建议不要）。
+2. 若 manifest 里 `subtitle_languages` 非空（多语言轨命中）：**总结读哪种语言？**（主轨 / 某附加轨 / 多轨对照）。仅单轨时跳过此问。
+
+用户答复决定读取策略：
 
 - **不要时间线（默认）**：读 `*.txt` 逐字稿——干净省 token，产出概要/要点/关键词
 - **要时间线**：读 `*.srt`——按时间轴抽锚点，时间线小节格式 `[MM:SS] 该时段要点`；正文理解仍可参考 txt，不必整篇重读
+- **多语言轨**：附加轨文件为 `<标题>.<语言>.srt`（如 `.en.srt`）；语言清单看 manifest 的 `subtitle_languages`
 
 然后写 `summary.md` 到任务目录：文首加「视频信息」区块（标题用 manifest 的 display_title、发布时间）+ 结构化 Markdown（概要/要点/关键词；时间线仅用户要求时含）。
 
@@ -70,12 +87,13 @@ CLI 不会自行猜目录。解析顺序：
 
 ```
 <output-dir>/<run_id>/
-├── manifest.json          # 状态清单（snake_case，含 asr_source / transcript_path / error_code）
+├── manifest.json          # 状态清单（snake_case，含 asr_source / transcript_path / subtitle_languages / error_code）
 └── tasks/NNN/
     ├── <标题>（YYYY-MM-DD）.mp4
     ├── audio.16k.mp3      # 送 paraformer 的 16kHz 音轨
-    ├── <标题>.srt         # 真时间轴逐字稿字幕
-    ├── <标题>.txt         # 纯文本逐字稿（总结的输入）
+    ├── <标题>.srt         # 真时间轴逐字稿字幕（主轨）
+    ├── <标题>.<语言>.srt  # 多语言附加轨（仅 --languages 命中时）
+    ├── <标题>.txt         # 纯文本逐字稿（总结的输入，主轨）
     └── summary.md         # AI 总结（agent 第 2 段写入）
 ```
 
@@ -97,6 +115,7 @@ CLI 不会自行猜目录。解析顺序：
 - **whisper 首次运行**会下载模型（small 约 460MB）到用户缓存目录，国内网络建议先 `export HF_ENDPOINT=https://hf-mirror.com` 再跑。
 - 小红书短链（xhslink.com）无 Cookie 必 403：提示用户在 skill/.env 配 `LINK_PREVIEW_XIAOHONGSHU_COOKIE`，或改粘贴 explore 长链。
 - B 站 412 风控：配 `LINK_PREVIEW_BILIBILI_COOKIE`（浏览器整串 Cookie）。
-- B站 AI 字幕需登录态 Cookie 才能拉到；YouTube 自动字幕无需登录。
+- B站 AI 字幕需登录态 Cookie 才能拉到；YouTube 无 Cookie 常被人机验证拦截（`Sign in to confirm you're not a bot`）——配 `YOUTUBE_COOKIE_BROWSER=chrome`（或 edge/firefox 等）借浏览器登录态。
+- **机翻质量警告**：B站 AI 附加轨与 YouTube 自动字幕绝大多数是机器翻译，仅主语言轨（B站 ai-zh / YouTube 原语）接近原声质量。总结引用译文轨时向用户提示此局限。
 - 同名文件自动 `(1)` 递增，不会覆盖旧产物。
 - DashScope 报 `Arrearage` / "Access denied"：账号欠费，与 skill 本身无关。

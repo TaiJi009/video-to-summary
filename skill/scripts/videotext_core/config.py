@@ -32,6 +32,11 @@ def ffmpeg_path_env() -> str | None:
     return (os.environ.get("FFMPEG_PATH") or "").strip() or None
 
 
+def youtube_cookie_browser() -> str | None:
+    """借浏览器 Cookie 拉 YouTube 字幕（None=不使用）。"""
+    return (os.environ.get("YOUTUBE_COOKIE_BROWSER") or "").strip().lower() or None
+
+
 # --- 用户偏好（skill/preferences.json，gitignore）---
 
 PREFERENCES_PATH = SKILL_DIR / "preferences.json"

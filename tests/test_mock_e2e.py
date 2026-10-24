@@ -12,6 +12,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import video_batch_cli as cli
 from videotext_core import config
+import videotext_core.downloader as _dl
+_REAL_TRY_PLATFORM = _dl.try_platform_subtitles
 
 
 # --- paraformer HTTP fake ---
@@ -130,8 +132,8 @@ def patch_all(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "extract_info_metadata_only", lambda url: {"title": "测试视频标题", "duration": 250.0, "timestamp": 1704038400})
     monkeypatch.setattr(cli, "effective_download_url", lambda url: url)
     # 字幕轨捷径默认不命中（专门测试时单独覆盖）
-    monkeypatch.setattr(dl_mod, "try_platform_subtitles", lambda url, d, stem: None)
-    monkeypatch.setattr(cli, "try_platform_subtitles", lambda url, d, stem: None)
+    monkeypatch.setattr(dl_mod, "try_platform_subtitles", lambda url, d, stem, langs=None: None)
+    monkeypatch.setattr(cli, "try_platform_subtitles", lambda url, d, stem, langs=None: None)
 
 
 def _run_cli(argv):
@@ -190,8 +192,8 @@ def test_platform_subtitle_shortcut_skips_download_and_asr(monkeypatch, tmp_path
     fake_srt.write_text(srt_content, encoding="utf-8")
 
     import videotext_core.downloader as dl_mod
-    monkeypatch.setattr(dl_mod, "try_platform_subtitles", lambda url, d, stem: fake_srt)
-    monkeypatch.setattr(cli, "try_platform_subtitles", lambda url, d, stem: fake_srt)
+    monkeypatch.setattr(dl_mod, "try_platform_subtitles", lambda url, d, stem, langs=None: fake_srt)
+    monkeypatch.setattr(cli, "try_platform_subtitles", lambda url, d, stem, langs=None: fake_srt)
 
     def _no_download(url, outtmpl):
         raise AssertionError("字幕轨命中时不应下载视频")
@@ -412,3 +414,91 @@ def test_whisper_engine_not_installed_fails_with_guidance(monkeypatch, tmp_path,
     assert task["status"] == "failed"
     assert task["error_code"] == "WHISPER_NOT_INSTALLED"
     assert "--with-whisper" in task["error_detail"]
+
+
+# --- 多语言字幕轨 ---
+
+def test_multilang_subtitles_all(monkeypatch, tmp_path):
+    """--languages all：主轨 + 附加轨都落盘，manifest 记语言清单。"""
+    patch_all(monkeypatch, tmp_path)
+    out_root = tmp_path / "runsML"
+
+    # mock player API 直查：ai-zh 主轨 + ai-es/ai-ar 两附加轨
+    def fake_bili_api(url, task_dir, stem, languages):
+        from videotext_core.downloader import _write_bili_json_as_srt
+
+        body_zh = [{"from": 0.0, "to": 1.5, "content": "你好"}]
+        body_es = [{"from": 0.0, "to": 1.5, "content": "Hola"}]
+        body_ar = [{"from": 0.0, "to": 1.5, "content": "مرحبا"}]
+        _write_bili_json_as_srt(body_zh, task_dir / f"{stem}.srt")
+        _write_bili_json_as_srt(body_es, task_dir / f"{stem}.ai-es.srt")
+        _write_bili_json_as_srt(body_ar, task_dir / f"{stem}.ai-ar.srt")
+        return task_dir / f"{stem}.srt", ["ai-zh", "ai-es", "ai-ar"]
+
+    import videotext_core.downloader as dl_mod
+    monkeypatch.setattr(dl_mod, "_bili_ai_subtitle_via_api", fake_bili_api)
+    monkeypatch.setattr(cli, "try_platform_subtitles", _REAL_TRY_PLATFORM)
+
+    sys_argv = sys.argv
+    sys.argv = [
+        "video_batch_cli.py", "run",
+        "--url", "https://www.bilibili.com/video/BVml",
+        "--output-dir", str(out_root),
+        "--languages", "all",
+        "--max-workers", "1",
+    ]
+    try:
+        code = cli.main()
+    finally:
+        sys.argv = sys_argv
+
+    assert code == 0
+    run_dir = next(out_root.iterdir())
+    m = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    task = m["tasks"][0]
+    assert task["status"] == "completed"
+    assert task["asr_source"] == "platform_subtitle"
+    assert sorted(task["subtitle_languages"]) == ["ai-ar", "ai-es"]
+    task_dir = Path(task["output_dir"])
+    assert (task_dir / "probe.srt").exists() or list(task_dir.glob("*.srt"))
+    # 主轨 + 两个附加轨 = 3 个 srt
+    assert len(list(task_dir.glob("*.srt"))) == 3
+    # 主轨 txt 产物仍生成
+    assert next(task_dir.glob("*.txt")) is not None
+
+
+def test_multilang_subtitles_default_single(monkeypatch, tmp_path):
+    """缺省（不带 --languages）：仅主轨，subtitle_languages 为空。"""
+    patch_all(monkeypatch, tmp_path)
+    out_root = tmp_path / "runsML2"
+
+    def fake_bili_api(url, task_dir, stem, languages):
+        from videotext_core.downloader import _write_bili_json_as_srt
+
+        assert languages is None, "缺省时应传 None（仅主轨）"
+        _write_bili_json_as_srt([{"from": 0.0, "to": 1.5, "content": "你好"}], task_dir / f"{stem}.srt")
+        return task_dir / f"{stem}.srt", []
+
+    import videotext_core.downloader as dl_mod
+    monkeypatch.setattr(dl_mod, "_bili_ai_subtitle_via_api", fake_bili_api)
+    monkeypatch.setattr(cli, "try_platform_subtitles", _REAL_TRY_PLATFORM)
+
+    sys_argv = sys.argv
+    sys.argv = [
+        "video_batch_cli.py", "run",
+        "--url", "https://www.bilibili.com/video/BVml2",
+        "--output-dir", str(out_root),
+        "--max-workers", "1",
+    ]
+    try:
+        code = cli.main()
+    finally:
+        sys.argv = sys_argv
+
+    assert code == 0
+    run_dir = next(out_root.iterdir())
+    m = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    task = m["tasks"][0]
+    assert task["status"] == "completed"
+    assert task["subtitle_languages"] == []
+    assert len(list((Path(task["output_dir"])).glob("*.srt"))) == 1
