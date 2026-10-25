@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""视频批量转写 CLI：URL → 逐字稿（SRT 时间轴 + TXT）。
+"""视频/本地文件批量转写 CLI：URL 或本地音视频 → 逐字稿（SRT 时间轴 + TXT）。
 
 用法：
   run   --url <URL> [--url ...] | --urls-file urls.txt
+        [--file <路径> ... | --files-file files.txt]   # 本地音频/视频，可与 URL 混填
         [--output-dir DIR] [--remember] [--max-workers N] [--verbose]
   status <run_id> [--output-dir DIR]
+  verify-key   # 验证 DASHSCOPE_API_KEY 可用性（零额度，不提交转写任务）
 
 产物：<output-dir>/<run_id>/manifest.json + tasks/NNN/（*.srt、*.txt、*.mp4）。
 总结由调用方 agent 的模型完成（读 transcript.txt 写 summary.md），CLI 不调用任何 LLM。
@@ -50,7 +52,7 @@ from videotext_core.metadata import (  # noqa: E402
     extract_duration_seconds,
     extract_info_metadata_only,
     format_video_publish_label,
-    normalize_urls,
+    normalize_inputs,
     preferred_title,
     upload_date_prefix_with_fallback,
 )
@@ -74,22 +76,65 @@ def _classify_asr_error(err: str) -> str:
         return "ASR_AUTH"
     if "429" in err or "Throttling" in err or "限流" in err:
         return "ASR_QUOTA"
+    if "Model.NotExists" in err or "InvalidModel" in err or "未开通" in err or "not open" in err.lower():
+        return "ASR_MODEL_NOT_ENABLED"
     return "ASR_FAILED"
 
 
 def process_single_task(run_dir: Path, entry: dict) -> None:
-    """处理单条任务：字幕轨捷径 → 下载 → 抽音轨 → paraformer 转写 → 双产物落盘。"""
+    """处理单条任务：本地文件 → 抽音轨 → 转写；URL → 字幕捷径 → 下载 → 抽音轨 → 转写。"""
     url = entry["url"]
     idx = entry["index"]
     task_dir = run_dir / "tasks" / f"{idx:03d}"
     task_dir.mkdir(parents=True, exist_ok=True)
     entry["output_dir"] = str(task_dir.resolve())
-    entry["platform"] = detect_platform(url)
+    entry["platform"] = "local" if entry.get("input_kind") == "file" else detect_platform(url)
     manifest.write_manifest(run_dir, RUN_STATE["manifest"])
 
     log = _progress_printer(f"#{idx:03d}", "task")
 
     try:
+        # 本地文件：跳过元数据/字幕轨/下载，标题取文件名
+        if entry.get("input_kind") == "file":
+            source_path = Path(entry["source_path"])
+            stem = sanitize_filename(source_path.stem)
+            entry["display_title"] = stem
+            duration = probe_media_duration_seconds(source_path)
+            entry["duration_seconds"] = duration
+            log(15, f"本地文件: {source_path.name} ({duration or '?'}s)")
+
+            engine = RUN_STATE.get("engine", "dashscope")
+            if engine == "dashscope" and duration and duration > config.ASR_MAX_FILE_SECONDS:
+                entry["status"] = "failed"
+                entry["error_code"] = "OVER_LENGTH"
+                entry["error_detail"] = (
+                    f"音频时长约 {int(duration // 60)} 分钟，超过云端引擎单文件上限 120 分钟。"
+                    "建议 --asr-engine whisper 本地转写，或人工分段。"
+                )
+                return
+
+            audio_path = task_dir / "audio.16k.mp3"
+            extract_audio_track(source_path, audio_path)
+            log(40, f"音轨就绪: {audio_path.name}")
+
+            if engine == "whisper":
+                result = whisper_transcribe(audio_path)
+                entry["asr_source"] = "whisper"
+            else:
+                result = transcribe(config.dashscope_api_key(), audio_path)
+                entry["asr_source"] = "paraformer"
+            log(85, f"转写完成: {len(result['transcript'])} 字")
+
+            srt_path = task_dir / f"{stem}.srt"
+            write_srt_with_timestamps(srt_path, result["sentences"])
+            transcript_txt = task_dir / f"{stem}.txt"
+            write_txt(transcript_txt, result["transcript"])
+            entry["subtitle_path"] = str(srt_path.resolve())
+            entry["transcript_path"] = str(transcript_txt.resolve())
+            entry["status"] = "completed"
+            log(100, "全部完成")
+            return
+
         # 1. 元数据（不下载）
         display_title = None
         meta = extract_info_metadata_only(url)
@@ -213,19 +258,24 @@ RUN_STATE: dict = {}
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    urls: list[str]
+    raw_inputs: list[str] = []
     if args.urls_file:
         raw = Path(args.urls_file).read_text(encoding="utf-8")
-        urls = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    elif args.url:
-        urls = list(args.url)
-    else:
-        print(json.dumps({"error": "必须提供 --url 或 --urls-file"}), file=sys.stderr)
+        raw_inputs += [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if args.url:
+        raw_inputs += list(args.url)
+    if args.files_file:
+        raw = Path(args.files_file).read_text(encoding="utf-8")
+        raw_inputs += [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if args.file:
+        raw_inputs += list(args.file)
+    if not raw_inputs:
+        print(json.dumps({"error": "必须提供 --url / --urls-file / --file / --files-file 之一"}), file=sys.stderr)
         return 2
 
-    urls, err = normalize_urls(urls)
+    inputs, err = normalize_inputs(raw_inputs)
     if err:
-        print(json.dumps({"error": f"URL 非法（{err}）"}), file=sys.stderr)
+        print(json.dumps({"error": f"输入非法（{err}）"}), file=sys.stderr)
         return 2
 
     engine = args.asr_engine
@@ -267,12 +317,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    m = manifest.create_manifest(run_dir, run_id, urls)
+    m = manifest.create_manifest(run_dir, run_id, inputs)
     RUN_STATE["manifest"] = m
     RUN_STATE["verbose"] = args.verbose
     RUN_STATE["languages"] = args.languages
 
-    max_workers = max(1, min(int(args.max_workers), len(urls)))
+    max_workers = max(1, min(int(args.max_workers), len(inputs)))
 
     print(f"run_id: {run_id}", flush=True)
     print(f"run_dir: {run_dir}", flush=True)
@@ -297,6 +347,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     manifest.finalize_manifest(run_dir, m)
     print(json.dumps(manifest.status_summary(m), ensure_ascii=False))
     return 0 if m["status"] == "completed" else 1
+
+
+def cmd_verify_key(args: argparse.Namespace) -> int:
+    from videotext_core.asr_verify import verify_key
+
+    api_key = config.dashscope_api_key()
+    if api_key is None:
+        print(
+            json.dumps({
+                "error": "未配置 DASHSCOPE_API_KEY，无法验证。"
+                "若用户从未开通过阿里云百炼，请按 skill/references/bailian-onboarding.md 引导注册开通；"
+                "已有账号则到百炼控制台 API-Key 页（地域：北京）创建后写入 skill/.env。",
+            }, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        return 2
+    result = verify_key(api_key)
+    print(json.dumps(result, ensure_ascii=False))
+    if result["status"] == "ok":
+        return 0
+    return 2 if result["status"] == "invalid" else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -325,6 +396,8 @@ def main() -> int:
     p_run = sub.add_parser("run", help="批量转写")
     p_run.add_argument("--url", action="append", help="视频 URL（可多次）")
     p_run.add_argument("--urls-file", help="每行一个 URL 的文本文件")
+    p_run.add_argument("--file", action="append", help="本地音频/视频文件路径（可多次，与 --url 可混填）")
+    p_run.add_argument("--files-file", help="每行一个本地文件路径的文本文件")
     p_run.add_argument("--output-dir", help="产物根目录（首次使用时必须提供，配合 --remember 记住）")
     p_run.add_argument("--remember", action="store_true", help="把 --output-dir 保存为默认，后续省略")
     p_run.add_argument("--max-workers", type=int, default=3)
@@ -339,6 +412,9 @@ def main() -> int:
     p_status.add_argument("run_id")
     p_status.add_argument("--output-dir", help="产物根目录（省略时读 preferences.json 默认）")
     p_status.set_defaults(func=cmd_status)
+
+    p_verify = sub.add_parser("verify-key", help="验证 DASHSCOPE_API_KEY 可用性（零额度，不提交转写）")
+    p_verify.set_defaults(func=cmd_verify_key)
 
     args = parser.parse_args()
     return args.func(args)

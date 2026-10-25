@@ -28,10 +28,12 @@ def new_run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
 
 
-def task_entry(url: str, index: int) -> dict:
+def task_entry(url: str, index: int, input_kind: str = "url", source_path: str | None = None) -> dict:
     return {
         "index": index,
         "url": url,
+        "input_kind": input_kind,
+        "source_path": source_path,
         "platform": "unknown",
         "display_title": None,
         "status": "pending",
@@ -46,16 +48,25 @@ def task_entry(url: str, index: int) -> dict:
     }
 
 
-def create_manifest(run_dir: Path, run_id: str, urls: list[str]) -> dict:
+def create_manifest(run_dir: Path, run_id: str, inputs: list) -> dict:
+    """inputs: list[str]（旧式纯 URL）或 list[dict]（normalize_inputs 的 spec）。"""
+    if inputs and isinstance(inputs[0], dict):
+        entries = [
+            task_entry(spec["value"], i, input_kind=spec["kind"],
+                       source_path=spec["value"] if spec["kind"] == "file" else None)
+            for i, spec in enumerate(inputs)
+        ]
+    else:
+        entries = [task_entry(u, i) for i, u in enumerate(inputs)]
     manifest = {
         "run_id": run_id,
         "status": "running",
         "created_at": now_iso(),
         "completed_at": None,
-        "total": len(urls),
+        "total": len(entries),
         "completed": 0,
         "failed": 0,
-        "tasks": [task_entry(u, i) for i, u in enumerate(urls)],
+        "tasks": entries,
     }
     write_manifest(run_dir, manifest)
     return manifest
