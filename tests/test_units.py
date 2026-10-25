@@ -14,6 +14,7 @@ from videotext_core.filename_safe import sanitize_filename
 from videotext_core.metadata import (
     detect_platform,
     display_title_with_publish_date,
+    normalize_inputs,
     normalize_urls,
     preferred_title,
     strip_topic_hashtags,
@@ -61,6 +62,39 @@ def test_normalize_urls_rejects_illegal():
 def test_normalize_urls_rejects_empty():
     _, err = normalize_urls(["", "   "])
     assert err == "empty_urls"
+
+
+# --- normalize_inputs（URL + 本地文件混填）---
+
+def test_normalize_inputs_url_and_file(tmp_path):
+    f = tmp_path / "rec.mp3"
+    f.write_bytes(b"x")
+    specs, err = normalize_inputs(["  https://a.com/1 ", str(f)])
+    assert err is None
+    assert specs[0] == {"kind": "url", "value": "https://a.com/1"}
+    assert specs[1]["kind"] == "file"
+    assert specs[1]["value"] == str(f.resolve())
+
+
+def test_normalize_inputs_missing_file():
+    specs, err = normalize_inputs(["/nonexistent/path/rec.mp3"])
+    assert specs == []
+    assert err is not None and err.startswith("file_not_found")
+
+
+def test_normalize_inputs_rejects_directory(tmp_path):
+    _, err = normalize_inputs([str(tmp_path)])
+    assert err is not None and err.startswith("not_a_file")
+
+
+def test_normalize_inputs_rejects_other_scheme():
+    _, err = normalize_inputs(["ftp://a.com/1"])
+    assert err == "illegal_url"
+
+
+def test_normalize_inputs_empty():
+    _, err = normalize_inputs(["", "   "])
+    assert err == "empty_inputs"
 
 
 # --- sanitize_filename ---
@@ -174,6 +208,65 @@ def test_display_title_with_publish_date():
 
 # --- manifest ---
 
+class _FakeStaticResponse:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeStaticClient:
+    """所有 GET 返回固定 status；记录收到的 params。"""
+    status_code = 200
+    seen_params: list = []
+
+    def __init__(self, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url, params=None, headers=None):
+        type(self).seen_params.append(params)
+        return _FakeStaticResponse(type(self).status_code, "body")
+
+
+def test_verify_key_ok_covers_both_models(monkeypatch):
+    import videotext_core.asr_verify as av
+
+    _FakeStaticClient.status_code = 200
+    _FakeStaticClient.seen_params = []
+    monkeypatch.setattr(av.httpx, "Client", _FakeStaticClient)
+    res = av.verify_key("sk-test")
+    assert res["status"] == "ok"
+    assert set(res["checks"]) == {"paraformer-v2", "paraformer-realtime-v2"}
+    assert all(c["status"] == "ok" for c in res["checks"].values())
+    models = {p.get("model") for p in _FakeStaticClient.seen_params}
+    assert models == {"paraformer-v2", "paraformer-realtime-v2"}
+
+
+def test_verify_key_invalid_on_401(monkeypatch):
+    import videotext_core.asr_verify as av
+
+    _FakeStaticClient.status_code = 401
+    _FakeStaticClient.seen_params = []
+    monkeypatch.setattr(av.httpx, "Client", _FakeStaticClient)
+    res = av.verify_key("sk-bad")
+    assert res["status"] == "invalid"
+    assert all(c["status"] == "invalid" for c in res["checks"].values())
+
+
+def test_verify_key_error_on_500(monkeypatch):
+    import videotext_core.asr_verify as av
+
+    _FakeStaticClient.status_code = 500
+    _FakeStaticClient.seen_params = []
+    monkeypatch.setattr(av.httpx, "Client", _FakeStaticClient)
+    res = av.verify_key("sk-x")
+    assert res["status"] == "error"
+
 def test_manifest_create_write_load(tmp_path):
     m = manifest.create_manifest(tmp_path, "20260101-000000-abcd", ["https://a.com/1", "https://b.com/2"])
     loaded = manifest.load_manifest(tmp_path)
@@ -209,3 +302,22 @@ def test_manifest_status_summary_failed_urls(tmp_path):
 def test_manifest_load_corrupt_returns_none(tmp_path):
     (tmp_path / "manifest.json").write_text("{not json", encoding="utf-8")
     assert manifest.load_manifest(tmp_path) is None
+
+
+# --- verify_key（getPolicy 鉴权，零额度）---
+
+
+def test_manifest_spec_inputs_record_input_kind(tmp_path):
+    """spec dict 输入：manifest 记 input_kind 与 source_path。"""
+    f = tmp_path / "a.mp3"
+    f.write_bytes(b"x")
+    specs = [
+        {"kind": "url", "value": "https://a.com/1"},
+        {"kind": "file", "value": str(f)},
+    ]
+    m = manifest.create_manifest(tmp_path, "r", specs)
+    tu, tf = m["tasks"]
+    assert tu["input_kind"] == "url" and tu["source_path"] is None
+    assert tf["input_kind"] == "file"
+    assert tf["source_path"] == str(f)
+    assert tf["url"] == str(f)

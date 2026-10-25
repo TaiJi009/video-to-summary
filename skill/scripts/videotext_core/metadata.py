@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 from . import config
@@ -36,6 +37,30 @@ def normalize_urls(raw: list[str]) -> tuple[list[str], str | None]:
     if not cleaned:
         return [], "empty_urls"
     return cleaned, None
+
+
+def normalize_inputs(raw: list[str]) -> tuple[list[dict], str | None]:
+    """URL 与本地文件混填归一化：http(s) → url，其余按本地路径校验存在性。"""
+    specs: list[dict] = []
+    for item in raw:
+        s = item.strip()
+        if not s:
+            continue
+        p = urlparse(s)
+        if p.scheme in ("http", "https") and p.netloc:
+            specs.append({"kind": "url", "value": s})
+            continue
+        if p.scheme and p.scheme not in ("http", "https"):
+            return [], "illegal_url"
+        path = Path(s).expanduser()
+        if not path.exists():
+            return [], f"file_not_found: {s}"
+        if not path.is_file():
+            return [], f"not_a_file: {s}"
+        specs.append({"kind": "file", "value": str(path.expanduser().resolve())})
+    if not specs:
+        return [], "empty_inputs"
+    return specs, None
 
 
 def strip_topic_hashtags(title: str) -> str:

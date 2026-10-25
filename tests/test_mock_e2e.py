@@ -502,3 +502,108 @@ def test_multilang_subtitles_default_single(monkeypatch, tmp_path):
     assert task["status"] == "completed"
     assert task["subtitle_languages"] == []
     assert len(list((Path(task["output_dir"])).glob("*.srt"))) == 1
+
+
+# --- 本地文件输入（--file）---
+
+def test_run_local_file_ingestion(monkeypatch, tmp_path):
+    """--file：跳过元数据/字幕/下载，直接抽音轨转写；manifest 记 input_kind/platform。"""
+    patch_all(monkeypatch, tmp_path)
+    out_root = tmp_path / "runsF"
+
+    src = tmp_path / "我的会议录音.mp4"
+    src.write_bytes(b"F" * 1000)
+
+    def _no_download(url, outtmpl):
+        raise AssertionError("本地文件任务不应触发下载")
+
+    def _no_meta(url):
+        raise AssertionError("本地文件任务不应拉元数据")
+
+    monkeypatch.setattr(cli, "download_with_ytdlp", _no_download)
+    monkeypatch.setattr(cli, "extract_info_metadata_only", _no_meta)
+
+    code = _run_cli([
+        "video_batch_cli.py", "run",
+        "--file", str(src),
+        "--output-dir", str(out_root),
+        "--max-workers", "1",
+    ])
+    assert code == 0
+    run_dir = next(out_root.iterdir())
+    m = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    task = m["tasks"][0]
+    assert task["status"] == "completed"
+    assert task["input_kind"] == "file"
+    assert task["source_path"] == str(src)
+    assert task["platform"] == "local"
+    assert task["asr_source"] == "paraformer"
+    assert task["display_title"] == "我的会议录音"
+    task_dir = Path(task["output_dir"])
+    srt = next(task_dir.glob("*.srt"))
+    assert "你好" in srt.read_text(encoding="utf-8")
+    txt = next(task_dir.glob("*.txt"))
+    assert txt.read_text(encoding="utf-8").strip() == "你好世界第二句"
+    assert (task_dir / "audio.16k.mp3").is_file()
+
+
+def test_run_missing_file_exit2(monkeypatch, tmp_path, capsys):
+    patch_all(monkeypatch, tmp_path)
+    code = _run_cli([
+        "video_batch_cli.py", "run",
+        "--file", "/nonexistent/rec.mp3",
+        "--output-dir", str(tmp_path / "runsF2"),
+        "--max-workers", "1",
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "file_not_found" in err
+
+
+def test_run_mixed_url_and_file(monkeypatch, tmp_path):
+    """URL 与本地文件混填：两条任务各自按 input_kind 走管线。"""
+    patch_all(monkeypatch, tmp_path)
+    out_root = tmp_path / "runsMIX"
+
+    src = tmp_path / "audio_note.mp3"
+    src.write_bytes(b"A" * 500)
+
+    code = _run_cli([
+        "video_batch_cli.py", "run",
+        "--url", "https://www.bilibili.com/video/BVmix",
+        "--file", str(src),
+        "--output-dir", str(out_root),
+        "--max-workers", "1",
+    ])
+    assert code == 0
+    run_dir = next(out_root.iterdir())
+    m = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    kinds = {t["input_kind"] for t in m["tasks"]}
+    assert kinds == {"url", "file"}
+    assert m["status"] == "completed"
+
+
+# --- verify-key 命令 ---
+
+def test_verify_key_command_ok(monkeypatch, tmp_path, capsys):
+    patch_all(monkeypatch, tmp_path)
+    import videotext_core.asr_verify as av
+
+    class _OKClient(FakeParaformerHTTP):
+        pass
+
+    # getPolicy 返回 200（FakeParaformerHTTP 已按此实现），直接用其 GET 分支
+    monkeypatch.setattr(av.httpx, "Client", FakeParaformerHTTP)
+    code = _run_cli(["video_batch_cli.py", "verify-key"])
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "ok"
+
+
+def test_verify_key_command_missing_key(monkeypatch, tmp_path, capsys):
+    patch_all(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "dashscope_api_key", lambda: None)
+    code = _run_cli(["video_batch_cli.py", "verify-key"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "bailian-onboarding" in err
